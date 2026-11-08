@@ -17,13 +17,21 @@ const lib = join(scripts, "ocr-runtime-pack.ps1");
 const work = mkdtempSync(join(tmpdir(), "ocr-runtime-pack-"));
 afterAll(() => rmSync(work, { recursive: true, force: true }));
 
+// Windows PowerShell 5.1 started from a PowerShell 7 parent (the CI runner) inherits pwsh's PSModulePath and
+// then cannot load its own Microsoft.PowerShell.Utility (Get-FileHash). Let 5.1 rebuild its default path.
+const ps51Env = (() => {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.toLowerCase() === "psmodulepath") delete env[key];
+  return env;
+})();
+
 const sha256 = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
 
 /** Run PowerShell statements after dot-sourcing the library; returns the exit code and output. */
 function ps(body: string) {
   const file = join(work, `t-${Math.random().toString(36).slice(2)}.ps1`);
   writeFileSync(file, `$ErrorActionPreference = 'Stop'\n. '${lib}'\n${body}\n`);
-  const run = Bun.spawnSync(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file]);
+  const run = Bun.spawnSync(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", file], { env: ps51Env });
   return { code: run.exitCode, out: run.stdout.toString(), err: run.stderr.toString() };
 }
 
@@ -135,7 +143,7 @@ describe("the committed pin and allowlist", () => {
     const run = Bun.spawnSync([
       "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", join(scripts, "package.ps1"),
       "-SkipBuild", "-SkipGithubDigest", "-OutDir", join(work, "out"),
-    ]);
+    ], { env: ps51Env });
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr.toString()).toContain("-SkipGithubDigest is only for a local -OcrRuntimeZip");
   });
