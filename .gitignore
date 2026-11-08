@@ -1,0 +1,18 @@
+# build output
+/target/
+/crates/*/target/
+/dist/
+
+# keys and secrets never live here (only keys/*.pub are tracked)
+*.key
+*.pem
+*.pfx
+*.p12
+*.sig
+keys/*
+!keys/README.md
+!keys/*.pub
+
+# local scratch
+/.tmp/
+*.log

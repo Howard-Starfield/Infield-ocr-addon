@@ -1,0 +1,27 @@
+# The only files taken from the official llama.cpp Windows Vulkan release zip (pinned in
+# config/sources.json) into the add-on's ocr-vlm/ folder. One name per line.
+# Every other tool exe in the zip (llama-cli, llama-bench, ggml-rpc*, ...) is left out.
+llama-server.exe
+llama-server-impl.dll
+llama-common.dll
+llama.dll
+mtmd.dll
+ggml.dll
+ggml-base.dll
+ggml-vulkan.dll
+ggml-cpu-alderlake.dll
+ggml-cpu-cannonlake.dll
+ggml-cpu-cascadelake.dll
+ggml-cpu-cooperlake.dll
+ggml-cpu-haswell.dll
+ggml-cpu-icelake.dll
+ggml-cpu-ivybridge.dll
+ggml-cpu-piledriver.dll
+ggml-cpu-sandybridge.dll
+ggml-cpu-sapphirerapids.dll
+ggml-cpu-skylakex.dll
+ggml-cpu-sse42.dll
+ggml-cpu-x64.dll
+ggml-cpu-zen4.dll
+libomp.dll
+LICENSE-LLVM-OpenMP

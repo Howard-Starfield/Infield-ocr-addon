@@ -1,0 +1,56 @@
+# The sidecar has no network code. Model and document paths come from the app.
+# Run: cargo deny --manifest-path crates/ocr-sidecar/Cargo.toml check bans licenses sources
+# (advisories separately: a new advisory should not silently block an unrelated change).
+
+[graph]
+# The only target a release is built for.
+targets = ["x86_64-pc-windows-msvc"]
+
+[advisories]
+version = 2
+# Reviewed at bootstrap. Each is a transitive dependency of oar-ocr / hayro that this repository cannot
+# upgrade on its own; revisit with the next release of those crates (or ort).
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained compile-time proc-macro (via image/exr); no vulnerability" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained font parser (via oar-ocr's imageproc/ab_glyph); no vulnerability" },
+    { id = "RUSTSEC-2026-0383", reason = "webpki-root-certs: only used by ureq inside ort-sys's build script (the hash-verified ONNX Runtime download); never linked into the shipped executable" },
+]
+
+[licenses]
+version = 2
+# All permissive. A new licence needs a look at NOTICE before it is added here.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# The two crates of this repository (publish = false).
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[bans]
+multiple-versions = "allow"
+deny = [
+    { crate = "reqwest" },
+    { crate = "hyper" },
+    { crate = "curl" },
+    { crate = "hf-hub" },
+    # ureq is ort-sys's build-time ORT fetch, hash-verified.
+    { crate = "ureq", wrappers = ["ort-sys"] },
+    { crate = "native-tls", wrappers = ["ureq"] },
+]

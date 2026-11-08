@@ -1,0 +1,39 @@
+[package]
+name = "infield-ocr"
+version = "0.2.0"
+edition = "2021"
+publish = false
+description = "Infield OCR add-on sidecar: PDF render, text-layer check, layout, OCR and tables over a framed stdio protocol"
+
+# Own workspace and Cargo.lock: oar-ocr pins ort rc.13 while the host app pins another ort,
+# and ort-sys declares `links = "onnxruntime"`. No `rust-version` on purpose;
+# oar-ocr declares 1.95, so build with `--ignore-rust-version`.
+[workspace]
+
+[lib]
+name = "infield_ocr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "infield-ocr"
+path = "src/main.rs"
+
+[dependencies]
+infield-ocr-protocol = { path = "../ocr-protocol" }
+oar-ocr = { version = "=0.10.0", default-features = false, features = ["download-binaries", "simd"] }
+hayro = "=0.8.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "tiff"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = false

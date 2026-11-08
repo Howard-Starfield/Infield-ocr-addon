@@ -1,0 +1,97 @@
+name: candidate
+
+# Builds a release candidate (manifest, archive, SHA256SUMS) from main and attests its provenance.
+# It holds no signing key and publishes nothing: the maintainer downloads the artifact, scans it, signs the
+# manifest locally and creates the release by hand (docs/RELEASE.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The add-on version; must equal the version in crates/ocr-sidecar/Cargo.toml"
+        required: true
+        type: string
+
+permissions: {}
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    # Read-only: the build scripts (ort-sys and others) run in this job with network access, so it gets no
+    # OIDC token and no write access. No caches are used.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-deny@0.19.6
+      - name: Install the pinned Rust toolchain
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern 'channel\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          rustup toolchain install $channel --profile minimal --no-self-update
+      - name: The input version must equal the crate version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          $crate = (Select-String -Path crates/ocr-sidecar/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($env:INPUT_VERSION -ne $crate) { throw "input version $env:INPUT_VERSION is not the crate version $crate" }
+      - name: Guard
+        run: ./scripts/check-repo.ps1
+      - name: Tests
+        run: |
+          cargo test --locked --manifest-path crates/ocr-protocol/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'protocol tests failed' }
+          cargo test --locked --ignore-rust-version --manifest-path crates/ocr-sidecar/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'sidecar tests failed' }
+          bun test scripts/ocr-runtime-pack.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'packaging tests failed' }
+      - name: Dependency policy (advisories block here)
+        run: cargo deny --manifest-path crates/ocr-sidecar/Cargo.toml check bans licenses sources advisories
+      - name: Build and package (release build, deterministic archive)
+        run: ./scripts/package.ps1 -OutDir dist/candidate
+      - name: Scan the package for build-machine leaks
+        run: |
+          $zip = (Get-ChildItem dist/candidate -Filter 'infield-ocr-*.zip').FullName
+          ./scripts/scan-package.ps1 -Zip $zip -Extra (Get-ChildItem dist/candidate -Filter 'manifest-*.json').FullName
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ocr-addon-candidate-${{ inputs.version }}
+          path: dist/candidate/*
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 30
+
+  attest:
+    needs: build
+    runs-on: windows-2025
+    # Only this job can ask for an OIDC token, and it runs nothing but the attestation of the checksum file.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ocr-addon-candidate-${{ inputs.version }}
+          path: candidate
+      - name: SHA256SUMS must match the downloaded files
+        run: |
+          Set-Location candidate
+          foreach ($line in Get-Content SHA256SUMS) {
+            $hash, $name = $line -split '\s+', 2
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $name).Hash.ToLowerInvariant() -ne $hash) { throw "checksum mismatch: $name" }
+          }
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-checksums: candidate/SHA256SUMS

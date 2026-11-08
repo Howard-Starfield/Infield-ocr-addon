@@ -1,0 +1,15 @@
+Infield OCR add-on: third-party components
+
+- oar-ocr / oar-ocr-core 0.10.0 (Apache-2.0): LICENSES/oar-ocr.txt
+- hayro 0.8.0 (Apache-2.0 OR MIT): LICENSES/hayro.txt
+- ONNX Runtime 1.28.0 (MIT), linked statically: LICENSES/onnxruntime.txt
+- DirectML.dll 1.15.4 (Microsoft DirectX Machine Learning license terms), shipped beside
+  the exe because the ONNX Runtime build imports it at load time; DirectML itself is not
+  used for inference. The terms and notices are copied unchanged from the official
+  Microsoft.AI.DirectML 1.15.4 NuGet package (nuget.org): LICENSES/directml.txt and
+  LICENSES/directml-third-party-notices.txt. The shipped DLL is that package's
+  bin/x64-win/DirectML.dll (18,527,776 bytes).
+- Other Rust crates: see Cargo.lock in the source repository (permissive licenses,
+  checked with cargo-deny).
+- Model files are not part of this archive; they are downloaded separately
+  (PaddleOCR models, Apache-2.0).

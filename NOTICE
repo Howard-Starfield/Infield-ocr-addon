@@ -1,0 +1,29 @@
+Infield OCR add-on
+==================
+
+The source code in this repository is licensed under the MIT License (see LICENSE).
+
+Release archives are different: they intentionally contain third-party binaries that are
+not covered by this repository's MIT license. They are listed here and in
+crates/ocr-sidecar/LICENSES/THIRD-PARTY.txt, each under its own terms:
+
+- ONNX Runtime 1.28.0 (MIT), linked statically into the sidecar executable
+  (crates/ocr-sidecar/LICENSES/onnxruntime.txt).
+- DirectML.dll 1.15.4 from the Microsoft.AI.DirectML NuGet package, redistributed unmodified
+  under Microsoft's DirectX Machine Learning license terms
+  (crates/ocr-sidecar/LICENSES/directml.txt and directml-third-party-notices.txt).
+  DirectML is not open source.
+- oar-ocr 0.10.0 (Apache-2.0) and hayro 0.8.0 (Apache-2.0 OR MIT), compiled into the sidecar
+  (crates/ocr-sidecar/LICENSES/oar-ocr.txt and hayro.txt).
+- llama.cpp / ggml (MIT), the official ggml-org Windows Vulkan release, shipped unmodified in the
+  archive's ocr-vlm/ folder, with its bundled components' licenses
+  (third_party/ocr-vlm-licenses/: llama.cpp, cpp-httplib, nlohmann json, BoringSSL) and the LLVM
+  OpenMP runtime (Apache-2.0 WITH LLVM-exception).
+
+Models are not part of this repository or of any release archive. Infield downloads them, at the
+user's request, from the vendor or maintainer: the PaddleOCR-derived models (Apache-2.0) from the
+oar-ocr maintainer's releases and GLM-OCR (MIT) from the llama.cpp organisation's GGUF conversion.
+Their licenses apply to those files.
+
+The exact versions, URLs, hashes and sizes of everything pinned for a release are in
+config/sources.json.

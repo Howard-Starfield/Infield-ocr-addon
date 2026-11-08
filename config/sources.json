@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "release": {
+    "target": "x86_64-pc-windows-msvc",
+    "min_app_version": "0.8.1"
+  },
+  "llama_cpp": {
+    "build": "b11718",
+    "asset": "llama-b11718-bin-win-vulkan-x64.zip",
+    "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11718/llama-b11718-bin-win-vulkan-x64.zip",
+    "sha256": "237e5736031a9cdcf9eff54e1f4e9bd871945de1d56ec542ecb9ebaf8d45bdb6",
+    "size": 32307966,
+    "allowlist": "config/ocr-vlm-allowlist.txt"
+  },
+  "directml": {
+    "nuget_id": "Microsoft.AI.DirectML",
+    "version": "1.15.4",
+    "dll_in_package": "bin/x64-win/DirectML.dll",
+    "sha256": "9c9e6d822561c6c41b90e6994b3e8857cf1d66dbfb1e0c4c799c7c89b4e92da1",
+    "size": 18527776
+  },
+  "onnxruntime": {
+    "version": "1.28.0",
+    "via": "ort-sys 2.0.0-rc.13 download-binaries (prebuilt static library, hash-pinned inside ort-sys)",
+    "informational": true
+  }
+}
