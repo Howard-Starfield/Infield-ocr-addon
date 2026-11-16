@@ -232,6 +232,7 @@ fn dense_page(blocks: usize) -> PageResult {
                 crop_file: None,
                 model: None,
                 vlm_fallback: false,
+                lines: Vec::new(),
             })
             .collect(),
         render_ms: 10,
@@ -497,4 +498,89 @@ fn the_crop_list_is_the_plan_list() {
         assert!(!wants_rgb_crop(kind), "{kind:?}");
     }
     assert_eq!(MIN_VLM_REGIONS, 2);
+}
+
+// ---- line boxes: additive, the protocol version stays 2 -----------------------------------------
+
+const OLD_BLOCK: &str = r#"{"id":1,"kind":"text","bbox":[0.0,0.0,1.0,1.0],"order":1,"text":"t","cells":null,"confidence":0.9,"crop_file":null}"#;
+
+fn line(i: usize, text: &str) -> Line {
+    Line { bbox: [1.0, 2.0 + i as f32, 30.0, 12.0 + i as f32], text: text.to_string(), confidence: 0.75 }
+}
+
+fn block_with_lines(lines: Vec<Line>) -> Block {
+    let mut b: Block = serde_json::from_str(OLD_BLOCK).unwrap();
+    b.lines = lines;
+    b
+}
+
+#[test]
+fn a_block_from_before_lines_existed_decodes_with_no_lines() {
+    let b: Block = serde_json::from_str(OLD_BLOCK).unwrap();
+    assert!(b.lines.is_empty());
+    // No lines: the key is not written, so the block is byte-identical to the old encoding.
+    let again = serde_json::to_string(&b).unwrap();
+    assert!(!again.contains("lines"), "{again}");
+    assert_eq!(serde_json::from_str::<Block>(&again).unwrap(), b);
+}
+
+#[test]
+fn a_block_with_lines_roundtrips() {
+    let b = block_with_lines(vec![line(0, "first line"), line(1, "second line")]);
+    let json = serde_json::to_string(&b).unwrap();
+    assert!(json.contains(r#""lines":[{"bbox":[1.0,2.0,30.0,12.0],"text":"first line","confidence":0.75}"#), "{json}");
+    assert_eq!(serde_json::from_str::<Block>(&json).unwrap(), b);
+}
+
+#[test]
+fn a_line_refuses_unknown_fields() {
+    assert!(serde_json::from_str::<Line>(r#"{"bbox":[0,0,1,1],"text":"t","confidence":1.0,"extra":1}"#).is_err());
+}
+
+#[test]
+fn analyze_without_emit_lines_serializes_exactly_as_before() {
+    let a: Analyze = serde_json::from_str(V2_ANALYZE).unwrap();
+    assert!(!a.emit_lines);
+    assert_eq!(serde_json::to_string(&a).unwrap(), V2_ANALYZE, "an older sidecar never sees the field");
+    let mut on = a.clone();
+    on.emit_lines = true;
+    let json = serde_json::to_string(&on).unwrap();
+    assert!(json.contains(r#""emit_lines":true"#), "{json}");
+    assert_eq!(serde_json::from_str::<Analyze>(&json).unwrap(), on);
+}
+
+#[test]
+fn the_capability_is_named_emit_lines_and_the_version_stays_2() {
+    assert_eq!(CAP_EMIT_LINES, "emit_lines");
+    assert_eq!(PROTOCOL_VERSION, 2);
+    let ok: HelloOk = serde_json::from_str(
+        r#"{"protocol":2,"sidecar_version":"0.2.0","ort_version":"1.28","capabilities":["emit_crops","emit_lines"]}"#,
+    )
+    .unwrap();
+    assert_eq!(ok.capabilities, vec![CAP_EMIT_CROPS.to_string(), CAP_EMIT_LINES.to_string()]);
+}
+
+/// The most a page may carry (2,000 lines of 1,000 characters) fits one frame with room to spare.
+#[test]
+fn a_2000_line_page_fits_the_frame_cap() {
+    let long = "x".repeat(1000);
+    let lines: Vec<Line> = (0..2000).map(|i| line(i, &long)).collect();
+    let mut b = block_with_lines(lines);
+    b.text = Some(long.clone());
+    let page = PageResult {
+        page: 1,
+        width: 2000,
+        height: 3000,
+        source: PageSource::Ocr,
+        blocks: vec![b],
+        render_ms: 1,
+        analyze_ms: 1,
+        peak_working_set_mb: 1,
+        doc_page_count: 1,
+    };
+    let mut buf = Vec::new();
+    write_page_result(&mut buf, 0, &page).expect("a full page is within the frame cap");
+    assert!((buf.len() as u64) < MAX_PAYLOAD_BYTES / 4, "{} bytes", buf.len());
+    let frame = read_frame(&mut buf.as_slice(), 0).unwrap();
+    assert_eq!(decode_page_result(&frame).unwrap(), page);
 }

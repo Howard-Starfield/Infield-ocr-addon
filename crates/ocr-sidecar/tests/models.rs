@@ -107,6 +107,7 @@ fn run_document_full(input: &Path, max_pages: u32, models: FastModels, crop_dir:
             crop_dir: crop_dir.to_path_buf(),
             max_pages: 0,
             emit_crops,
+            emit_lines: false,
         },
     );
     let mut pages = Vec::new();

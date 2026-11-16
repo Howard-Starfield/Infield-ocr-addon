@@ -40,6 +40,7 @@ fn text_layer_pages_emit_no_crops() {
         crop_dir: crop_dir.clone(),
         max_pages: 0,
         emit_crops: true,
+        emit_lines: false,
     };
     let mut pages = Vec::new();
     let mut analyzer = OarAnalyzer;

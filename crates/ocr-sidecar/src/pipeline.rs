@@ -14,7 +14,7 @@ use hayro::hayro_syntax::Pdf;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
 use image::{ImageFormat, RgbImage};
 use infield_ocr_protocol::{
-    encode_rgb_crop, page_crop_name, region_crop_name, wants_rgb_crop, Analyze, Block, BlockKind, Cell, Done, ErrorCode,
+    encode_rgb_crop, page_crop_name, region_crop_name, wants_rgb_crop, Analyze, Block, BlockKind, Cell, Done, ErrorCode, Line,
     FastModels, PageResult, PageSource, TableCells, MAX_RGB_CROP_BYTES, MIN_VLM_REGIONS, RGB_CROP_HEADER_LEN,
 };
 use oar_ocr::core::config::OrtSessionConfig;
@@ -119,6 +119,7 @@ impl Analyzer for StubAnalyzer {
                         crop_file: None,
                         model: None,
                         vlm_fallback: false,
+                        lines: Vec::new(),
                     })
                     .collect()
             } else {
@@ -330,6 +331,86 @@ fn write_crop(img: &RgbImage, bbox: [f32; 4], dir: &Path, name: &str) -> Option<
     Some(name.to_string())
 }
 
+/// Most lines kept for one page, in detection order. A page with more is a hostile or broken
+/// input; the cap also keeps the page frame far below the protocol's payload cap.
+pub const MAX_LINES_PER_PAGE: usize = 2000;
+/// Most characters kept for one line.
+pub const MAX_LINE_CHARS: usize = 1000;
+
+/// One recognized text line before it is assigned to a block: an axis-aligned box in page pixels,
+/// the text and the recognizer's confidence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineCandidate {
+    pub bbox: [f32; 4],
+    pub text: String,
+    pub confidence: f32,
+}
+
+/// The recognized lines of a page as candidates. A line's box is the axis-aligned box of its
+/// detection polygon (the box as detected, before any layout-guided refinement); a region with no
+/// text or no points is skipped.
+fn line_candidates(result: &oar_ocr::domain::structure::StructureResult) -> Vec<LineCandidate> {
+    result
+        .text_regions
+        .iter()
+        .flatten()
+        .filter_map(|r| {
+            let text = r.text.as_deref()?;
+            let poly = r.dt_poly.as_ref().unwrap_or(&r.bounding_box);
+            if poly.points.is_empty() {
+                return None;
+            }
+            Some(LineCandidate {
+                bbox: [poly.x_min(), poly.y_min(), poly.x_max(), poly.y_max()],
+                text: text.to_string(),
+                confidence: r.confidence.unwrap_or(0.0),
+            })
+        })
+        .collect()
+}
+
+fn intersection_area(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let w = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
+    let h = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    w * h
+}
+
+/// Attach each candidate to the block it overlaps most (the first one on a tie) and drop the
+/// rest. Dropped: a line whose box has a non-finite coordinate or no area once clamped to the
+/// page, whose text is empty or only whitespace, and one that overlaps no block. A kept line has
+/// its box clamped to `width` x `height`, its text cut to [`MAX_LINE_CHARS`] characters and its
+/// confidence held in 0..=1. At most [`MAX_LINES_PER_PAGE`] lines are kept, in input order.
+pub fn attach_lines(blocks: &mut [Block], candidates: Vec<LineCandidate>, width: f32, height: f32) {
+    let mut kept = 0usize;
+    for c in candidates {
+        if kept >= MAX_LINES_PER_PAGE {
+            break;
+        }
+        if !c.bbox.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        let text: String = c.text.chars().take(MAX_LINE_CHARS).collect();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let bbox = clamp_box(c.bbox, width, height);
+        if bbox[2] <= bbox[0] || bbox[3] <= bbox[1] {
+            continue;
+        }
+        let mut best: Option<(usize, f32)> = None;
+        for (i, b) in blocks.iter().enumerate() {
+            let area = intersection_area(bbox, b.bbox);
+            if area > 0.0 && best.is_none_or(|(_, a)| area > a) {
+                best = Some((i, area));
+            }
+        }
+        let Some((i, _)) = best else { continue };
+        let confidence = if c.confidence.is_finite() { c.confidence.clamp(0.0, 1.0) } else { 0.0 };
+        blocks[i].lines.push(Line { bbox, text, confidence });
+        kept += 1;
+    }
+}
+
 fn blocks_from(
     result: &oar_ocr::domain::structure::StructureResult,
     img: &RgbImage,
@@ -383,7 +464,12 @@ fn blocks_from(
             crop_file,
             model: None,
             vlm_fallback: false,
+            lines: Vec::new(),
         });
+    }
+    // Before the crop pass: its full-page block must not capture the lines of a flyer.
+    if req.emit_lines {
+        attach_lines(&mut blocks, line_candidates(result), img.width() as f32, img.height() as f32);
     }
     if req.emit_crops {
         add_rgb_crops(&mut blocks, img, req, page);
@@ -453,6 +539,7 @@ pub fn add_rgb_crops(blocks: &mut Vec<Block>, img: &RgbImage, req: &Analyze, pag
                 crop_file: Some(name),
                 model: None,
                 vlm_fallback: false,
+                lines: Vec::new(),
             });
         }
     }
@@ -547,6 +634,39 @@ fn render_pdf_page<'a>(
     RgbImage::from_raw(pw, ph, rgb)
 }
 
+/// Decode an image file to RGB, upright: the EXIF orientation (a phone photo is stored sideways
+/// with a tag saying how to turn it) is applied here, so the page is OCR'd the way it is shown and
+/// every box is in the upright image's pixels. The size is checked from the header before any
+/// pixel is decoded, whatever `max_side` is.
+pub fn decode_image(data: &[u8]) -> Result<RgbImage, AnalyzeError> {
+    use image::ImageDecoder;
+    let unsupported = |m: &str| AnalyzeError::new(ErrorCode::UnsupportedInput, m.to_string());
+    let open = || {
+        image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .map_err(|_| unsupported("the image format is not supported"))
+    };
+    let (w, h) = open()?
+        .into_dimensions()
+        .map_err(|_| unsupported("the image could not be decoded"))?;
+    if w.max(h) > MAX_IMAGE_SIDE || w as u64 * h as u64 > MAX_IMAGE_PIXELS {
+        return Err(unsupported("the image is too large"));
+    }
+    let mut reader = open()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+    reader.limits(limits);
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|_| unsupported("the image could not be decoded"))?;
+    // A missing or unreadable tag means upright.
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img =
+        image::DynamicImage::from_decoder(decoder).map_err(|_| unsupported("the image could not be decoded"))?;
+    img.apply_orientation(orientation);
+    Ok(img.to_rgb8())
+}
+
 fn read_input(path: &Path) -> Result<Vec<u8>, AnalyzeError> {
     let meta = std::fs::metadata(path).map_err(|_| AnalyzeError::new(ErrorCode::BadInput, "input file not found"))?;
     if !meta.is_file() || meta.len() > MAX_INPUT_BYTES {
@@ -629,6 +749,7 @@ impl Analyzer for OarAnalyzer {
                                     crop_file: None,
                                     model: None,
                                     vlm_fallback: false,
+                                    lines: Vec::new(),
                                 })
                                 .collect();
                             return Ok(PageResult {
@@ -668,28 +789,7 @@ impl Analyzer for OarAnalyzer {
             }
             let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<PageResult, AnalyzeError> {
                 let t = Instant::now();
-                let unsupported = |m: &str| AnalyzeError::new(ErrorCode::UnsupportedInput, m.to_string());
-                let open = || {
-                    image::ImageReader::new(std::io::Cursor::new(&data))
-                        .with_guessed_format()
-                        .map_err(|_| unsupported("the image format is not supported"))
-                };
-                // Header-only size check, before any pixel is decoded and whatever max_side is.
-                let (w, h) = open()?
-                    .into_dimensions()
-                    .map_err(|_| unsupported("the image could not be decoded"))?;
-                if w.max(h) > MAX_IMAGE_SIDE || w as u64 * h as u64 > MAX_IMAGE_PIXELS {
-                    return Err(unsupported("the image is too large"));
-                }
-                let mut reader = open()?;
-                let mut limits = image::Limits::default();
-                limits.max_alloc = Some(MAX_IMAGE_ALLOC);
-                reader.limits(limits);
-                let img = reader
-                    .decode()
-                    .map_err(|_| unsupported("the image could not be decoded"))?
-                    .to_rgb8();
-                let img = downscale(img, req.max_side);
+                let img = downscale(decode_image(&data)?, req.max_side);
                 let render_ms = ms(t);
                 if structure.is_none() {
                     structure = Some(build_structure(req)?);
@@ -737,6 +837,7 @@ mod tests {
             crop_dir: dir.to_path_buf(),
             max_pages: 0,
             emit_crops: true,
+            emit_lines: false,
         }
     }
 
@@ -752,6 +853,7 @@ mod tests {
             crop_file: None,
             model: None,
             vlm_fallback: false,
+            lines: Vec::new(),
         }
     }
 
@@ -1127,5 +1229,284 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("p.rgb").join("inner")).unwrap();
         assert_eq!(write_rgb_crop(&page_image(), [10.0, 10.0, 100.0, 40.0], dir.path(), "p.rgb"), None);
         assert!(!files_in(dir.path()).iter().any(|n| n.ends_with(".tmp")), "no temp file is left behind");
+    }
+
+    // ----- line boxes (`emit_lines`)
+
+    fn cand(bbox: [f32; 4], text: &str) -> LineCandidate {
+        LineCandidate { bbox, text: text.to_string(), confidence: 0.8 }
+    }
+
+    fn two_blocks() -> Vec<Block> {
+        vec![
+            block(0, BlockKind::Text, [10.0, 10.0, 150.0, 60.0], Some("top")),
+            block(1, BlockKind::Text, [10.0, 100.0, 150.0, 160.0], Some("bottom")),
+        ]
+    }
+
+    fn texts(b: &Block) -> Vec<&str> {
+        b.lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    #[test]
+    fn a_line_goes_to_the_block_it_overlaps_most() {
+        let mut blocks = two_blocks();
+        attach_lines(
+            &mut blocks,
+            vec![
+                cand([12.0, 12.0, 140.0, 30.0], "in the first"),
+                cand([12.0, 110.0, 140.0, 130.0], "in the second"),
+                cand([12.0, 35.0, 140.0, 55.0], "also first"),
+            ],
+            200.0,
+            300.0,
+        );
+        assert_eq!(texts(&blocks[0]), vec!["in the first", "also first"], "kept in detection order");
+        assert_eq!(texts(&blocks[1]), vec!["in the second"]);
+        assert_eq!(blocks[0].lines[0].bbox, [12.0, 12.0, 140.0, 30.0]);
+        assert_eq!(blocks[0].lines[0].confidence, 0.8);
+    }
+
+    #[test]
+    fn between_overlapping_blocks_the_larger_intersection_wins_and_a_tie_goes_to_the_first() {
+        let mut blocks = vec![
+            block(0, BlockKind::Text, [0.0, 0.0, 100.0, 100.0], Some("a")),
+            block(1, BlockKind::Text, [0.0, 80.0, 100.0, 200.0], Some("b")),
+        ];
+        attach_lines(
+            &mut blocks,
+            vec![
+                cand([0.0, 75.0, 100.0, 110.0], "25 in a, 30 in b"),
+                cand([0.0, 70.0, 100.0, 110.0], "30 in a, 30 in b"),
+                cand([0.0, 60.0, 100.0, 110.0], "40 in a, 30 in b"),
+            ],
+            200.0,
+            300.0,
+        );
+        assert_eq!(texts(&blocks[0]), vec!["30 in a, 30 in b", "40 in a, 30 in b"]);
+        assert_eq!(texts(&blocks[1]), vec!["25 in a, 30 in b"]);
+    }
+
+    #[test]
+    fn a_line_that_touches_no_block_is_dropped() {
+        let mut blocks = two_blocks();
+        attach_lines(
+            &mut blocks,
+            vec![cand([12.0, 70.0, 140.0, 90.0], "between"), cand([160.0, 10.0, 190.0, 60.0], "beside")],
+            200.0,
+            300.0,
+        );
+        assert!(blocks.iter().all(|b| b.lines.is_empty()));
+    }
+
+    #[test]
+    fn empty_blank_and_boxless_lines_are_dropped() {
+        let mut blocks = two_blocks();
+        attach_lines(
+            &mut blocks,
+            vec![
+                cand([12.0, 12.0, 140.0, 30.0], ""),
+                cand([12.0, 12.0, 140.0, 30.0], "  \t\n "),
+                cand([12.0, 12.0, 12.0, 30.0], "zero width"),
+                cand([12.0, 30.0, 140.0, 30.0], "zero height"),
+                cand([140.0, 12.0, 12.0, 30.0], "inverted"),
+                cand([f32::NAN, 12.0, 140.0, 30.0], "nan"),
+                cand([12.0, f32::INFINITY, 140.0, 30.0], "inf"),
+                cand([12.0, 12.0, 140.0, 30.0], "kept"),
+            ],
+            200.0,
+            300.0,
+        );
+        assert_eq!(texts(&blocks[0]), vec!["kept"]);
+    }
+
+    #[test]
+    fn a_box_sticking_out_of_the_page_is_clamped_to_it() {
+        let mut blocks = vec![block(0, BlockKind::Text, [0.0, 0.0, 200.0, 300.0], Some("page"))];
+        attach_lines(&mut blocks, vec![cand([-30.0, -5.0, 260.0, 400.0], "wide"), cand([500.0, 500.0, 900.0, 900.0], "far")], 200.0, 300.0);
+        assert_eq!(texts(&blocks[0]), vec!["wide"], "a box wholly outside the page has no area once clamped");
+        assert_eq!(blocks[0].lines[0].bbox, [0.0, 0.0, 200.0, 300.0]);
+    }
+
+    #[test]
+    fn confidence_is_kept_inside_zero_to_one() {
+        let mut blocks = two_blocks();
+        let mut a = cand([12.0, 12.0, 140.0, 30.0], "a");
+        a.confidence = f32::NAN;
+        let mut b = cand([12.0, 32.0, 140.0, 50.0], "b");
+        b.confidence = 7.0;
+        attach_lines(&mut blocks, vec![a, b], 200.0, 300.0);
+        assert_eq!(blocks[0].lines[0].confidence, 0.0);
+        assert_eq!(blocks[0].lines[1].confidence, 1.0);
+    }
+
+    #[test]
+    fn a_page_keeps_at_most_2000_lines_and_a_line_at_most_1000_characters() {
+        let mut blocks = vec![block(0, BlockKind::Text, [0.0, 0.0, 200.0, 300.0], Some("page"))];
+        let many: Vec<LineCandidate> = (0..2500).map(|i| cand([1.0, 1.0, 100.0, 20.0], &format!("line {i}"))).collect();
+        attach_lines(&mut blocks, many, 200.0, 300.0);
+        assert_eq!(blocks[0].lines.len(), MAX_LINES_PER_PAGE);
+        assert_eq!(MAX_LINES_PER_PAGE, 2000);
+        assert_eq!(blocks[0].lines[0].text, "line 0");
+        assert_eq!(blocks[0].lines[1999].text, "line 1999", "the first 2000 in detection order");
+
+        // 1,500 two-byte characters: cut at 1,000 characters, on a character boundary.
+        let mut blocks = vec![block(0, BlockKind::Text, [0.0, 0.0, 200.0, 300.0], Some("page"))];
+        attach_lines(&mut blocks, vec![cand([1.0, 1.0, 100.0, 20.0], &"é".repeat(1500))], 200.0, 300.0);
+        assert_eq!(blocks[0].lines[0].text.chars().count(), MAX_LINE_CHARS);
+        assert_eq!(MAX_LINE_CHARS, 1000);
+    }
+
+    #[test]
+    fn the_cap_counts_only_lines_that_were_kept() {
+        let mut blocks = vec![block(0, BlockKind::Text, [0.0, 0.0, 200.0, 300.0], Some("page"))];
+        let mut many: Vec<LineCandidate> = (0..3000).map(|_| cand([1.0, 1.0, 100.0, 20.0], "")).collect();
+        many.push(cand([1.0, 1.0, 100.0, 20.0], "real"));
+        attach_lines(&mut blocks, many, 200.0, 300.0);
+        assert_eq!(texts(&blocks[0]), vec!["real"]);
+    }
+
+    fn with_regions(
+        mut result: oar_ocr::domain::structure::StructureResult,
+        regions: &[([f32; 4], &str)],
+    ) -> oar_ocr::domain::structure::StructureResult {
+        use oar_ocr::domain::TextRegion;
+        use oar_ocr::processors::BoundingBox;
+        let list = regions
+            .iter()
+            .map(|(b, t)| {
+                let mut r = TextRegion::new(BoundingBox::from_coords(b[0], b[1], b[2], b[3]));
+                r.text = Some(std::sync::Arc::from(*t));
+                r.confidence = Some(0.9);
+                r
+            })
+            .collect();
+        result.text_regions = Some(list);
+        result
+    }
+
+    #[test]
+    fn blocks_from_attaches_the_text_regions_only_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = with_regions(
+            two_text_regions_and_a_figure(),
+            &[([12.0, 12.0, 140.0, 30.0], "line one"), ([12.0, 62.0, 140.0, 80.0], "line two")],
+        );
+        let mut off = request(dir.path());
+        off.emit_crops = false;
+        off.emit_lines = false;
+        let without = blocks_from(&result, &page_image(), &off, 1);
+        assert!(without.iter().all(|b| b.lines.is_empty()));
+        // The flag off equals a page that had no text regions at all, block for block.
+        let plain = blocks_from(&two_text_regions_and_a_figure(), &page_image(), &off, 1);
+        assert_eq!(without, plain, "flag off: byte-identical blocks");
+
+        let mut on = off.clone();
+        on.emit_lines = true;
+        let with = blocks_from(&result, &page_image(), &on, 1);
+        assert_eq!(texts(&with[0]), vec!["line one"]);
+        assert_eq!(texts(&with[1]), vec!["line two"]);
+        assert!(with[2].lines.is_empty());
+        // Nothing else about the blocks changed.
+        let strip = |mut v: Vec<Block>| {
+            v.iter_mut().for_each(|b| b.lines.clear());
+            v
+        };
+        assert_eq!(strip(with), plain);
+    }
+
+    #[test]
+    fn blocks_from_uses_the_detection_polygon_box_and_the_full_page_block_gets_no_lines() {
+        use oar_ocr::domain::TextRegion;
+        use oar_ocr::processors::{BoundingBox, Point};
+        let dir = tempfile::tempdir().unwrap();
+        let mut result = structure(&[(LayoutElementType::Text, [10.0, 10.0, 150.0, 40.0], Some("flyer"))]);
+        // A slightly rotated line: the polygon's axis-aligned box is what is used, not `bounding_box`.
+        let mut r = TextRegion::new(BoundingBox::from_coords(0.0, 0.0, 1.0, 1.0));
+        r.dt_poly = Some(BoundingBox::new(vec![
+            Point::new(20.0, 14.0),
+            Point::new(120.0, 12.0),
+            Point::new(121.0, 30.0),
+            Point::new(21.0, 32.0),
+        ]));
+        r.text = Some(std::sync::Arc::from("tilted"));
+        r.confidence = Some(0.7);
+        result.text_regions = Some(vec![r]);
+        let mut req = request(dir.path()); // emit_crops: true adds a full-page block for a flyer
+        req.emit_lines = true;
+        let blocks = blocks_from(&result, &page_image(), &req, 1);
+        assert_eq!(blocks.len(), 2, "the flyer gets its full-page crop block");
+        assert_eq!(blocks[0].lines.len(), 1);
+        assert_eq!(blocks[0].lines[0].bbox, [20.0, 12.0, 121.0, 32.0]);
+        assert_eq!(blocks[0].lines[0].confidence, 0.7);
+        assert!(blocks[1].lines.is_empty(), "lines are attached before the full-page block exists");
+    }
+
+    // ----- EXIF orientation at decode
+
+    /// A 40 x 20 JPEG, left half red and right half blue, carrying the EXIF orientation `exif`
+    /// (spliced in as an APP1 segment right after the SOI marker).
+    fn jpeg_with_orientation(exif: Option<u16>) -> Vec<u8> {
+        let img = RgbImage::from_fn(40, 20, |x, _| if x < 20 { Rgb([255, 0, 0]) } else { Rgb([0, 0, 255]) });
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode_image(&img)
+            .unwrap();
+        let Some(o) = exif else { return jpeg };
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II*\0\x08\0\0\0"); // little-endian, first IFD at 8
+        tiff.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+        tiff.extend_from_slice(&1u32.to_le_bytes()); // count
+        tiff.extend_from_slice(&o.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]); // value padding
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        let mut seg = b"Exif\0\0".to_vec();
+        seg.extend_from_slice(&tiff);
+        let mut out = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        out.extend_from_slice(&((seg.len() + 2) as u16).to_be_bytes());
+        out.extend_from_slice(&seg);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    fn red(p: &Rgb<u8>) -> bool {
+        p[0] > 200 && p[2] < 80
+    }
+    fn blue(p: &Rgb<u8>) -> bool {
+        p[2] > 200 && p[0] < 80
+    }
+
+    #[test]
+    fn an_exif_6_photo_is_decoded_upright() {
+        // Orientation 6 = rotate 90 clockwise: the 40 x 20 landscape becomes 20 x 40, red half on top.
+        let img = decode_image(&jpeg_with_orientation(Some(6))).unwrap();
+        assert_eq!((img.width(), img.height()), (20, 40));
+        assert!(red(img.get_pixel(10, 5)), "{:?}", img.get_pixel(10, 5));
+        assert!(blue(img.get_pixel(10, 35)), "{:?}", img.get_pixel(10, 35));
+    }
+
+    #[test]
+    fn exif_orientations_8_and_3_and_the_absent_tag() {
+        let img = decode_image(&jpeg_with_orientation(Some(8))).unwrap(); // rotate 90 counter-clockwise
+        assert_eq!((img.width(), img.height()), (20, 40));
+        assert!(blue(img.get_pixel(10, 5)) && red(img.get_pixel(10, 35)));
+        let img = decode_image(&jpeg_with_orientation(Some(3))).unwrap(); // upside down
+        assert_eq!((img.width(), img.height()), (40, 20));
+        assert!(blue(img.get_pixel(5, 10)) && red(img.get_pixel(35, 10)));
+        for plain in [None, Some(1)] {
+            let img = decode_image(&jpeg_with_orientation(plain)).unwrap();
+            assert_eq!((img.width(), img.height()), (40, 20), "no rotation: {plain:?}");
+            assert!(red(img.get_pixel(5, 10)) && blue(img.get_pixel(35, 10)));
+        }
+    }
+
+    #[test]
+    fn decode_image_still_refuses_what_it_refused_before() {
+        assert_eq!(decode_image(b"not an image").unwrap_err().code, ErrorCode::UnsupportedInput);
+        let mut png = Vec::new();
+        RgbImage::new(20_001, 1).write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png).unwrap();
+        assert_eq!(decode_image(&png).unwrap_err().code, ErrorCode::UnsupportedInput, "over the side cap");
     }
 }
