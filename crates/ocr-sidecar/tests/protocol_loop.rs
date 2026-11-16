@@ -72,6 +72,7 @@ fn analyze_req(first: u32, last: Option<u32>) -> Analyze {
         crop_dir: PathBuf::from("crops"),
         max_pages: 100,
         emit_crops: false,
+        emit_lines: false,
     }
 }
 
@@ -98,11 +99,11 @@ fn hello_then_analyze_streams_pages_then_done() {
 }
 
 #[test]
-fn hello_ok_lists_emit_crops() {
+fn hello_ok_lists_emit_crops_and_emit_lines() {
     let mut c = Client::start(StubAnalyzer::new(1));
     let ok = c.hello();
     assert_eq!(ok.protocol, PROTOCOL_VERSION, "the version stays 2: the capability is additive");
-    assert_eq!(ok.capabilities, vec![CAP_EMIT_CROPS.to_string()]);
+    assert_eq!(ok.capabilities, vec![CAP_EMIT_CROPS.to_string(), CAP_EMIT_LINES.to_string()]);
     c.finish();
 }
 

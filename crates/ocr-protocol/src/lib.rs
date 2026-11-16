@@ -228,6 +228,10 @@ pub struct Hello {
 /// per text-like block when [`Analyze::emit_crops`] is set (accurate reading).
 pub const CAP_EMIT_CROPS: &str = "emit_crops";
 
+/// A capability a sidecar may advertise in [`HelloOk::capabilities`]: it attaches one [`Line`]
+/// per recognized text line to the blocks when [`Analyze::emit_lines`] is set.
+pub const CAP_EMIT_LINES: &str = "emit_lines";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct HelloOk {
@@ -261,6 +265,11 @@ pub struct Analyze {
     /// false, so an older sidecar (which denies unknown fields) never sees it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub emit_crops: bool,
+    /// Also attach the recognized text lines (box, text, confidence) to the blocks. The app sends
+    /// this only when the hello reply advertised [`CAP_EMIT_LINES`]; it is not serialized when
+    /// false, so an older sidecar (which denies unknown fields) never sees it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub emit_lines: bool,
 }
 
 /// Accurate reading adds `AccurateCrops`.
@@ -342,6 +351,20 @@ pub struct Block {
     /// The accurate reader failed on this block and the fast text was kept. Set by the app only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vlm_fallback: bool,
+    /// The text lines inside this block, in the sidecar's detection order, when
+    /// [`Analyze::emit_lines`] was set. Empty (and not written) otherwise, and for text-layer pages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<Line>,
+}
+
+/// One recognized text line: its axis-aligned box in the same pixel space as [`Block::bbox`], the
+/// text as read, and the recognizer's confidence (0..=1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct Line {
+    pub bbox: [f32; 4],
+    pub text: String,
+    pub confidence: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

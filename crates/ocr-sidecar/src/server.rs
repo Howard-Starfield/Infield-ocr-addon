@@ -15,7 +15,7 @@ use crate::pipeline::{AnalyzeError, Analyzer};
 use crate::{ORT_VERSION, VERSION};
 use infield_ocr_protocol::{
     read_frame, write_frame, write_page_result, Analyze, ErrorCode, ErrorFrame, Frame, FrameError, FrameKind, Hello,
-    HelloOk, PageResult, PageSource, CAP_EMIT_CROPS, PROTOCOL_VERSION,
+    HelloOk, PageResult, PageSource, CAP_EMIT_CROPS, CAP_EMIT_LINES, PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -135,7 +135,7 @@ where
                     protocol: PROTOCOL_VERSION,
                     sidecar_version: VERSION.to_string(),
                     ort_version: ORT_VERSION.to_string(),
-                    capabilities: vec![CAP_EMIT_CROPS.to_string()],
+                    capabilities: vec![CAP_EMIT_CROPS.to_string(), CAP_EMIT_LINES.to_string()],
                 },
             )?;
         }
