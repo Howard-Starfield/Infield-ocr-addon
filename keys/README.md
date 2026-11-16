@@ -4,12 +4,14 @@
 the add-on's manifest. Infield embeds the same two public keys and refuses a manifest that neither of
 them signed. The private halves never leave the maintainer's machine and are never committed.
 
-## Status: PLACEHOLDERS
+## Status: real keys (2026-11-15)
 
-Until the maintainer generates the real keys, both files contain the single line `PLACEHOLDER`,
-exactly like the placeholder constants in the Infield app (an app with placeholder keys refuses every
-manifest). Replace each file's content with the **base64 text** of the matching `.pub` file produced by
-`scripts/sign.ps1 -Generate`.
+| File | Minisign key id | Role |
+| --- | --- | --- |
+| `ocr-addon-active.pub` | `C6AB3C0917BC2FC1` | signs every release |
+| `ocr-addon-backup.pub` | `8F5E65A23C2388E7` | kept offline; used only if the active key is lost or rotated |
+
+Infield embeds the same two keys. A release manifest must verify against one of them.
 
 ## Format
 
