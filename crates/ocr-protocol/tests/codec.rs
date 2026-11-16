@@ -563,7 +563,8 @@ fn the_capability_is_named_emit_lines_and_the_version_stays_2() {
 /// The most a page may carry (2,000 lines of 1,000 characters) fits one frame with room to spare.
 #[test]
 fn a_2000_line_page_fits_the_frame_cap() {
-    let long = "x".repeat(1000);
+    // Control characters are the worst case: JSON writes each as a 6-byte \u00XX escape.
+    let long = "\u{1}".repeat(1000);
     let lines: Vec<Line> = (0..2000).map(|i| line(i, &long)).collect();
     let mut b = block_with_lines(lines);
     b.text = Some(long.clone());

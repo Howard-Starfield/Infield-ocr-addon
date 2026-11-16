@@ -346,9 +346,10 @@ pub struct LineCandidate {
     pub confidence: f32,
 }
 
-/// The recognized lines of a page as candidates. A line's box is the axis-aligned box of its
-/// detection polygon (the box as detected, before any layout-guided refinement); a region with no
-/// text or no points is skipped.
+/// The recognized lines of a page as candidates, in oar-ocr's order (detection order, except that
+/// regions it splits at layout block borders are appended). A line's box is the axis-aligned box
+/// of `dt_poly`, which oar-ocr has already clipped to the layout block for such regions; a region
+/// with no text or no points is skipped.
 fn line_candidates(result: &oar_ocr::domain::structure::StructureResult) -> Vec<LineCandidate> {
     result
         .text_regions
@@ -375,8 +376,12 @@ fn intersection_area(a: [f32; 4], b: [f32; 4]) -> f32 {
     w * h
 }
 
-/// Attach each candidate to the block it overlaps most (the first one on a tie) and drop the
-/// rest. Dropped: a line whose box has a non-finite coordinate or no area once clamped to the
+/// A block "holds" a line when it covers at least this share of the line's area.
+const HOLDS_LINE: f32 = 0.9;
+
+/// Attach each candidate to a block and drop the rest. The block is the tightest one that holds
+/// the line (a text block inside a figure box beats the figure); when none holds it, the one it
+/// overlaps most; ties go to the earlier block. Dropped: a line whose box has a non-finite coordinate or no area once clamped to the
 /// page, whose text is empty or only whitespace, and one that overlaps no block. A kept line has
 /// its box clamped to `width` x `height`, its text cut to [`MAX_LINE_CHARS`] characters and its
 /// confidence held in 0..=1. At most [`MAX_LINES_PER_PAGE`] lines are kept, in input order.
@@ -397,14 +402,33 @@ pub fn attach_lines(blocks: &mut [Block], candidates: Vec<LineCandidate>, width:
         if bbox[2] <= bbox[0] || bbox[3] <= bbox[1] {
             continue;
         }
-        let mut best: Option<(usize, f32)> = None;
+        let line_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]);
+        // Best block so far: (index, intersection, block area, holds the line).
+        let mut best: Option<(usize, f32, f32, bool)> = None;
         for (i, b) in blocks.iter().enumerate() {
-            let area = intersection_area(bbox, b.bbox);
-            if area > 0.0 && best.is_none_or(|(_, a)| area > a) {
-                best = Some((i, area));
+            let inter = intersection_area(bbox, b.bbox);
+            if inter <= 0.0 {
+                continue;
+            }
+            let holds = inter >= HOLDS_LINE * line_area;
+            let area = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+            let better = match best {
+                None => true,
+                // A block that holds the line beats one that does not; among those, the tighter
+                // block (a caption inside a figure box); otherwise the larger overlap. Ties keep
+                // the earlier block.
+                Some((_, bi, ba, bh)) => match (holds, bh) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    (true, true) => area < ba,
+                    (false, false) => inter > bi,
+                },
+            };
+            if better {
+                best = Some((i, inter, area, holds));
             }
         }
-        let Some((i, _)) = best else { continue };
+        let Some((i, ..)) = best else { continue };
         let confidence = if c.confidence.is_finite() { c.confidence.clamp(0.0, 1.0) } else { 0.0 };
         blocks[i].lines.push(Line { bbox, text, confidence });
         kept += 1;
@@ -656,15 +680,26 @@ pub fn decode_image(data: &[u8]) -> Result<RgbImage, AnalyzeError> {
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(MAX_IMAGE_ALLOC);
     reader.limits(limits);
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|_| unsupported("the image could not be decoded"))?;
+    let failed = |e: image::ImageError| {
+        if matches!(e, image::ImageError::Limits(_)) {
+            unsupported("the image is too large")
+        } else {
+            unsupported("the image could not be decoded")
+        }
+    };
+    let mut decoder = reader.into_decoder().map_err(failed)?;
+    // `reader.decode()` reserved the decoded size against the allocation limit; this path
+    // (needed to read the orientation first) does not, so the same check is made here, before
+    // anything is allocated. A 16-bit RGBA page is 8 bytes a pixel.
+    if decoder.total_bytes() > MAX_IMAGE_ALLOC {
+        return Err(unsupported("the image is too large"));
+    }
     // A missing or unreadable tag means upright.
     let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
-    let mut img =
-        image::DynamicImage::from_decoder(decoder).map_err(|_| unsupported("the image could not be decoded"))?;
+    // Reduced to 8-bit RGB before it is turned, so the extra copy is at most 3 bytes a pixel.
+    let mut img = image::DynamicImage::ImageRgb8(image::DynamicImage::from_decoder(decoder).map_err(failed)?.to_rgb8());
     img.apply_orientation(orientation);
-    Ok(img.to_rgb8())
+    Ok(img.into_rgb8())
 }
 
 fn read_input(path: &Path) -> Result<Vec<u8>, AnalyzeError> {
@@ -1500,6 +1535,72 @@ mod tests {
             assert_eq!((img.width(), img.height()), (40, 20), "no rotation: {plain:?}");
             assert!(red(img.get_pixel(5, 10)) && blue(img.get_pixel(35, 10)));
         }
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+
+    /// A PNG whose header claims `w` x `h`, 16-bit RGBA (8 bytes a pixel), with an empty pixel stream.
+    /// Nothing is allocated to build it: only the decoder's own size accounting can refuse it.
+    fn png_claiming_16bit_rgba(w: u32, h: u32) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+        }
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[16, 6, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &[0x78, 0x01, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01]);
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    #[test]
+    fn an_image_whose_decoded_size_is_over_the_allocation_cap_is_refused_before_it_is_allocated() {
+        // 8000 x 8000 x 8 bytes = 512 MB: inside the side and pixel caps, over the 400 MB cap.
+        let err = decode_image(&png_claiming_16bit_rgba(8000, 8000)).unwrap_err();
+        assert_eq!(err.code, ErrorCode::UnsupportedInput);
+        assert_eq!(err.message, "the image is too large");
+    }
+
+    #[test]
+    fn an_image_under_the_allocation_cap_gets_past_the_size_check() {
+        // 4000 x 4000 x 8 bytes = 128 MB passes the size check; its empty pixel stream then fails to decode.
+        let err = decode_image(&png_claiming_16bit_rgba(4000, 4000)).unwrap_err();
+        assert_eq!(err.message, "the image could not be decoded");
+    }
+
+    #[test]
+    fn a_line_inside_two_nested_blocks_goes_to_the_tighter_one() {
+        let mut blocks = vec![
+            block(0, BlockKind::Figure, [0.0, 0.0, 200.0, 300.0], None),
+            block(1, BlockKind::Text, [10.0, 10.0, 150.0, 40.0], Some("caption")),
+            block(2, BlockKind::Text, [10.0, 10.0, 190.0, 290.0], Some("wide")),
+        ];
+        attach_lines(&mut blocks, vec![cand([12.0, 12.0, 140.0, 30.0], "inside all three")], 200.0, 300.0);
+        assert_eq!(texts(&blocks[1]), vec!["inside all three"], "the smallest block that holds the line");
+        assert!(blocks[0].lines.is_empty() && blocks[2].lines.is_empty());
+        // A line that sticks out of the small block is not "held" by it: the larger overlap wins as before.
+        let mut blocks = vec![
+            block(0, BlockKind::Text, [0.0, 0.0, 100.0, 100.0], Some("a")),
+            block(1, BlockKind::Text, [0.0, 80.0, 100.0, 200.0], Some("b")),
+        ];
+        attach_lines(&mut blocks, vec![cand([0.0, 75.0, 100.0, 110.0], "straddles")], 200.0, 300.0);
+        assert_eq!(texts(&blocks[1]), vec!["straddles"]);
     }
 
     #[test]
